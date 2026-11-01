@@ -8,6 +8,7 @@ import io
 import os
 import pathlib
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1278,6 +1279,7 @@ class TestHNSWCatalogAwareContracts:
     def test_compaction_rebuilds_hnsw_when_src_catalog_has_custom_named_index(
         self, tmp_path: Path
     ) -> None:
+        """A custom-named source HNSW index is restored with its own name."""
         db = DuckDBProvider(tmp_path / "src_catalog.duckdb", base_directory=tmp_path)
         db.connect()
         try:
@@ -1295,7 +1297,8 @@ class TestHNSWCatalogAwareContracts:
             db.compact_database()
 
             remaining_indexes = _fetch_index_names(db.db_path)
-            assert "idx_hnsw_3" in remaining_indexes
+            assert "alt_live_idx" in remaining_indexes
+            assert "idx_hnsw_3" not in remaining_indexes
         finally:
             db.disconnect()
 
@@ -3245,20 +3248,22 @@ def test_compaction_preserves_all_canonical_tables_behaviorally(
 def test_non_cosine_hnsw_metric_survives_index_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Non-cosine HNSW indexes survive guarded and forced-compaction rebuilds.
+    """A forced sampled auto-compaction preserves a non-cosine HNSW metric.
 
-    The mutation guard rebuilds indexes once, then the sampled auto-compaction
-    (forced here via ``COMPACT_SAMPLE_INTERVAL = 1``) rebuilds them again. Both
-    paths must preserve the original metric. Regression for issue #456, where
-    compaction finalize hardcoded cosine.
+    A zero fragmentation threshold makes the freshly built HNSW index count as
+    compaction overhead, and ``COMPACT_SAMPLE_INTERVAL = 1`` forces the sampled
+    auto-compaction path, so no probability is involved. The compaction log and
+    the on-disk file size prove it ran. Regression for issue #456, where
+    finalize rebuilt the index with a hardcoded cosine metric.
     """
     from chunkhound.providers.database import serial_executor
 
+    monkeypatch.setattr(serial_executor, "COMPACT_SAMPLE_INTERVAL", 0)
     db = DuckDBProvider(tmp_path / "metric.duckdb", base_directory=tmp_path)
     db.config = DatabaseConfig(fragmentation_threshold_pct=0.0)
     db.connect()
     try:
-        _, original_chunk_id = _seed_embedding_dims_3(db)
+        _seed_embedding_dims_3(db)
         second_file_id = db.insert_file(
             File(
                 path="metric_second.py",
@@ -3303,28 +3308,126 @@ def test_non_cosine_hnsw_metric_survives_index_rebuild(
         assert len(before) == 1
         assert before[0]["metric"] == "l2sq"
 
-        # Force the sampled auto-compaction deterministically: sample every
-        # write and make the fragmentation check independent of file-size
-        # heuristics.
-        monkeypatch.setattr(serial_executor, "COMPACT_SAMPLE_INTERVAL", 1)
-        monkeypatch.setattr(
-            db, "_executor_measure_fragmentation", lambda conn, state: 10.0
+        db._execute_in_db_thread_sync("maybe_checkpoint", True)
+        size_before = os.path.getsize(db.db_path)
+
+        log_buffer = io.StringIO()
+        sink_id = logger.add(log_buffer, level="INFO")
+        try:
+            monkeypatch.setattr(serial_executor, "COMPACT_SAMPLE_INTERVAL", 1)
+            db._execute_in_db_thread_sync(
+                "insert_file",
+                File(
+                    path="metric_compaction_trigger.py",
+                    mtime=3.0,
+                    size_bytes=24,
+                    language=Language.PYTHON,
+                ),
+            )
+        finally:
+            logger.remove(sink_id)
+
+        assert "Compaction complete" in log_buffer.getvalue(), (
+            "forced sampled auto-compaction did not run"
         )
+        assert os.path.getsize(db.db_path) <= size_before * 1.05
 
-        compaction_runs: list[int] = []
-        original_compact = db._executor_compact_database
-
-        def _tracked_compact(conn: Any, state: dict[str, Any]) -> int:
-            compaction_runs.append(1)
-            return original_compact(conn, state)
-
-        monkeypatch.setattr(db, "_executor_compact_database", _tracked_compact)
-
-        db._execute_in_db_thread_sync("delete_chunks_batch", [original_chunk_id])
-
-        assert compaction_runs, "forced sampled auto-compaction did not run"
-        after = [i for i in db.get_existing_vector_indexes() if i["index_name"] == "idx_hnsw_3"]
+        after = [
+            i
+            for i in db.get_existing_vector_indexes()
+            if i["index_name"] == "idx_hnsw_3"
+        ]
         assert len(after) == 1
         assert after[0]["metric"] == "l2sq"
+    finally:
+        db.disconnect()
+
+
+def test_compaction_restore_preserves_non_cosine_hnsw_metric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollback after a post-swap failure keeps the source HNSW metric.
+
+    The compacted DB has no indexes. If the original backup is unrecoverable,
+    restore must rebuild HNSW from the source records instead of falling back
+    to canonical cosine indexes.
+    """
+    db = DuckDBProvider(
+        tmp_path / "restore_metric.duckdb", base_directory=tmp_path
+    )
+    db.connect()
+    try:
+        _seed_embedding_dims_3(db)
+        if "idx_hnsw_3" not in _fetch_index_names(db.db_path):
+            pytest.skip("DuckDB HNSW indexes are unavailable in this environment")
+
+        db.execute_query("DROP INDEX IF EXISTS idx_hnsw_3", [])
+        db.execute_query(
+            "CREATE INDEX idx_hnsw_3 ON embeddings_3 USING HNSW (embedding) "
+            "WITH (metric = 'l2sq')",
+            [],
+        )
+
+        def _fail_after_swap(
+            state: dict[str, Any],
+            db_path: Path,
+            compacted_path: Path,
+            backup_path: Path,
+            original_size: int,
+            hnsw_indexes: list[dict[str, Any]],
+            _t0: float,
+        ) -> int:
+            if windows_constants.IS_WINDOWS:
+                time.sleep(windows_constants.WINDOWS_FILE_HANDLE_DELAY)
+            duckdb_provider_module._atomic_replace(compacted_path, db_path)
+            # Advance past the swap before failing, and make the backup
+            # unrecoverable so rollback must rebuild HNSW on the compacted DB.
+            backup_path.unlink(missing_ok=True)
+            raise RuntimeError("simulated post-swap failure")
+
+        monkeypatch.setattr(db, "_compact_finalize", _fail_after_swap)
+
+        with pytest.raises(RuntimeError, match="simulated post-swap failure"):
+            db.compact_database()
+
+        after = [
+            i
+            for i in db.get_existing_vector_indexes()
+            if i["index_name"] == "idx_hnsw_3"
+        ]
+        assert len(after) == 1
+        assert after[0]["metric"] == "l2sq"
+        _assert_db_integrity(db.db_path)
+    finally:
+        db.disconnect()
+
+
+def test_compaction_fails_loudly_on_unknown_hnsw_metric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unsupported source metric aborts compaction before the DB swap."""
+    db = DuckDBProvider(tmp_path / "bad_metric.duckdb", base_directory=tmp_path)
+    db.connect()
+    try:
+        _seed_embedding_dims_3(db)
+        if "idx_hnsw_3" not in _fetch_index_names(db.db_path):
+            pytest.skip("DuckDB HNSW indexes are unavailable in this environment")
+
+        def _bogus_metric(
+            self: DuckDBProvider,
+            conn: Any,
+            index_name: str,
+            *,
+            strict: bool = False,
+        ) -> str:
+            return "bogus"
+
+        monkeypatch.setattr(DuckDBProvider, "_extract_hnsw_metric", _bogus_metric)
+
+        with pytest.raises(RuntimeError, match="Cannot restore HNSW index"):
+            db.compact_database()
+
+        assert "idx_hnsw_3" in _fetch_index_names(db.db_path)
+        _assert_db_integrity(db.db_path)
     finally:
         db.disconnect()
